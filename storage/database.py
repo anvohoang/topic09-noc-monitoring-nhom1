@@ -1,41 +1,63 @@
+"""SQLite storage layer for the NOC Monitoring Toolkit.
 
-from pathlib import Path
+The module stores system metrics, HTTP service checks, and alerts.
+All records support node-level identification through ``node_id``.
+"""
+
+from __future__ import annotations
+
 import math
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 
-# Duong dan den database
 DB_PATH = Path(__file__).resolve().parent / "noc_monitoring.db"
+DEFAULT_NODE_ID = "node-unknown"
 
 
 def get_connection(db_path: str | Path = DB_PATH) -> sqlite3.Connection:
-    """
-    Tao ket noi den SQLite database.
-    """
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    """Create and return a configured SQLite connection."""
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(str(db_path), timeout=10)
+    connection = sqlite3.connect(str(path), timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-
+    connection.execute("PRAGMA busy_timeout = 10000")
     return connection
 
 
+def _validate_non_empty_string(value: Any, field_name: str) -> str:
+    """Validate a required non-empty string and return its stripped value."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _get_node_id(data: dict[str, Any]) -> str:
+    """Read node_id while keeping compatibility with older callers."""
+    return _validate_non_empty_string(
+        data.get("node_id", DEFAULT_NODE_ID), "node_id"
+    )
+
+
+def _validate_limit(limit: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+
+
 def initialize_database(db_path: str | Path = DB_PATH) -> None:
-    """
-    Khoi tao database va cac bang neu chua ton tai.
-    """
+    """Create tables/indexes and migrate older databases to include node_id."""
     connection = get_connection(db_path)
 
     try:
-        cursor = connection.cursor()
-
-        # Bang 1: Luu chi so he thong
-        cursor.execute("""
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL DEFAULT 'node-unknown',
                 timestamp_utc TEXT NOT NULL,
                 cpu_percent REAL NOT NULL,
                 memory_percent REAL NOT NULL,
@@ -43,12 +65,14 @@ def initialize_database(db_path: str | Path = DB_PATH) -> None:
                 network_sent_bytes INTEGER,
                 network_recv_bytes INTEGER
             )
-        """)
+            """
+        )
 
-        # Bang 2: Luu ket qua kiem tra dich vu HTTP
-        cursor.execute("""
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS service_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL DEFAULT 'node-unknown',
                 timestamp_utc TEXT NOT NULL,
                 service_name TEXT NOT NULL,
                 url TEXT NOT NULL,
@@ -58,12 +82,14 @@ def initialize_database(db_path: str | Path = DB_PATH) -> None:
                 response_time_ms REAL,
                 error_message TEXT
             )
-        """)
+            """
+        )
 
-        # Bang 3: Luu lich su canh bao
-        cursor.execute("""
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL DEFAULT 'node-unknown',
                 created_at_utc TEXT NOT NULL,
                 metric_name TEXT NOT NULL,
                 severity TEXT NOT NULL,
@@ -72,62 +98,81 @@ def initialize_database(db_path: str | Path = DB_PATH) -> None:
                     CHECK (status IN ('active', 'resolved')),
                 resolved_at_utc TEXT
             )
-        """)
+            """
+        )
 
-        # Tao index de truy van nhanh hon
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_metrics_timestamp
-            ON metrics(timestamp_utc)
-        """)
+        # Migrate databases created before node_id was introduced.
+        # Existing records receive the neutral value 'node-unknown'.
+        for table_name in ("metrics", "service_checks", "alerts"):
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            }
+            if "node_id" not in columns:
+                connection.execute(
+                    f"""ALTER TABLE {table_name}
+                        ADD COLUMN node_id TEXT NOT NULL
+                        DEFAULT '{DEFAULT_NODE_ID}'"""
+                )
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_service_checks_timestamp
-            ON service_checks(timestamp_utc)
-        """)
-
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_alerts_status
-            ON alerts(status)
-        """)
+        # Retain the original indexes and add indexes for node-specific queries.
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_timestamp "
+            "ON metrics(timestamp_utc)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_service_checks_timestamp "
+            "ON service_checks(timestamp_utc)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_node_timestamp "
+            "ON metrics(node_id, timestamp_utc)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_service_node_timestamp "
+            "ON service_checks(node_id, timestamp_utc)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_node_status "
+            "ON alerts(node_id, status)"
+        )
 
         connection.commit()
-
     except sqlite3.Error:
         connection.rollback()
         raise
-
     finally:
         connection.close()
 
 
-def save_metrics(
-    metrics: dict,
-    db_path: str | Path = DB_PATH
-) -> int:
-    """
-    Luu mot ban ghi chi so he thong vao SQLite.
-    Tra ve ID cua ban ghi vua duoc tao.
-    """
+def save_metrics(metrics: dict[str, Any], db_path: str | Path = DB_PATH) -> int:
+    """Save one system-metrics record and return its database ID.
 
-    required_fields = [
+    ``network_sent_bytes`` and ``network_recv_bytes`` represent the byte
+    deltas collected during one sampling cycle, not cumulative counters.
+    """
+    if not isinstance(metrics, dict):
+        raise TypeError("metrics must be a dictionary")
+
+    required_fields = (
         "timestamp_utc",
         "cpu_percent",
         "memory_percent",
         "disk_percent",
-    ]
-
-    missing_fields = [
-        field for field in required_fields
-        if field not in metrics
-    ]
-
+    )
+    missing_fields = [field for field in required_fields if field not in metrics]
     if missing_fields:
         raise ValueError(f"Missing fields: {missing_fields}")
 
-    timestamp = metrics["timestamp_utc"]
-
-    if not isinstance(timestamp, str) or not timestamp.strip():
-        raise ValueError("timestamp_utc must be a non-empty string")
+    timestamp = _validate_non_empty_string(
+        metrics["timestamp_utc"], "timestamp_utc"
+    )
+    node_id = _get_node_id(metrics)
 
     try:
         cpu = float(metrics["cpu_percent"])
@@ -136,43 +181,43 @@ def save_metrics(
     except (TypeError, ValueError) as error:
         raise ValueError("CPU, memory and disk must be numeric") from error
 
-    # Kiem tra gia tri phan tram
-    for name, value in [
+    for name, value in (
         ("cpu_percent", cpu),
         ("memory_percent", memory),
         ("disk_percent", disk),
-    ]:
+    ):
         if not math.isfinite(value) or not 0 <= value <= 100:
-            raise ValueError(f"{name} must be between 0 and 100")
+            raise ValueError(f"{name} must be a finite number between 0 and 100")
 
     network_sent = metrics.get("network_sent_bytes")
     network_recv = metrics.get("network_recv_bytes")
-
-    # Kiem tra du lieu mang
-    for name, value in [
+    for name, value in (
         ("network_sent_bytes", network_sent),
         ("network_recv_bytes", network_recv),
-    ]:
-        if value is not None:
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
+    ):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be a non-negative integer or None")
 
     connection = get_connection(db_path)
-
     try:
         cursor = connection.execute(
             """
             INSERT INTO metrics (
+                node_id,
                 timestamp_utc,
                 cpu_percent,
                 memory_percent,
                 disk_percent,
                 network_sent_bytes,
                 network_recv_bytes
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                node_id,
                 timestamp,
                 cpu,
                 memory,
@@ -181,14 +226,11 @@ def save_metrics(
                 network_recv,
             ),
         )
-
         connection.commit()
-        return cursor.lastrowid
-
+        return int(cursor.lastrowid)
     except sqlite3.Error:
         connection.rollback()
         raise
-
     finally:
         connection.close()
 
@@ -198,117 +240,97 @@ def get_metrics(
     end_time: str | None = None,
     limit: int = 100,
     db_path: str | Path = DB_PATH,
-) -> list[dict]:
-    """
-    Truy van cac chi so he thong.
-    Ho tro loc theo khoang thoi gian.
-    """
-
-    if limit <= 0:
-        raise ValueError("limit must be greater than 0")
-
+    node_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get metrics newest-first, optionally filtered by time and node."""
+    _validate_limit(limit)
     query = "SELECT * FROM metrics"
-    conditions = []
-    parameters = []
+    conditions: list[str] = []
+    parameters: list[Any] = []
 
     if start_time is not None:
         conditions.append("timestamp_utc >= ?")
-        parameters.append(start_time)
-
+        parameters.append(_validate_non_empty_string(start_time, "start_time"))
     if end_time is not None:
         conditions.append("timestamp_utc <= ?")
-        parameters.append(end_time)
+        parameters.append(_validate_non_empty_string(end_time, "end_time"))
+    if node_id is not None:
+        conditions.append("node_id = ?")
+        parameters.append(_validate_non_empty_string(node_id, "node_id"))
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-
     query += " ORDER BY timestamp_utc DESC, id DESC LIMIT ?"
     parameters.append(limit)
 
     connection = get_connection(db_path)
-
     try:
-        cursor = connection.execute(query, parameters)
-        rows = cursor.fetchall()
-
+        rows = connection.execute(query, parameters).fetchall()
         return [dict(row) for row in rows]
-
     finally:
         connection.close()
 
 
 def save_service_check(
-    service_check: dict,
-    db_path: str | Path = DB_PATH
+    service_check: dict[str, Any], db_path: str | Path = DB_PATH
 ) -> int:
-    """
-    Luu ket qua kiem tra dich vu HTTP.
-    Tra ve ID cua ban ghi.
-    """
+    """Save one HTTP service-check result and return its database ID."""
+    if not isinstance(service_check, dict):
+        raise TypeError("service_check must be a dictionary")
 
-    required_fields = [
-        "timestamp_utc",
-        "service_name",
-        "url",
-        "is_available",
-    ]
-
+    required_fields = ("timestamp_utc", "service_name", "url", "is_available")
     missing_fields = [
-        field for field in required_fields
-        if field not in service_check
+        field for field in required_fields if field not in service_check
     ]
-
     if missing_fields:
         raise ValueError(f"Missing fields: {missing_fields}")
 
-    timestamp = service_check["timestamp_utc"]
-    service_name = service_check["service_name"]
-    url = service_check["url"]
+    timestamp = _validate_non_empty_string(
+        service_check["timestamp_utc"], "timestamp_utc"
+    )
+    node_id = _get_node_id(service_check)
+    service_name = _validate_non_empty_string(
+        service_check["service_name"], "service_name"
+    )
+    url = _validate_non_empty_string(service_check["url"], "url")
+
     is_available = service_check["is_available"]
-
-    if not isinstance(timestamp, str) or not timestamp.strip():
-        raise ValueError("Invalid timestamp_utc")
-
-    if not isinstance(service_name, str) or not service_name.strip():
-        raise ValueError("Invalid service_name")
-
-    if not isinstance(url, str) or not url.strip():
-        raise ValueError("Invalid url")
-
     if isinstance(is_available, bool):
         is_available = int(is_available)
-    elif isinstance(is_available, int) and is_available in (0, 1):
-        pass
-    else:
+    elif not (
+        isinstance(is_available, int)
+        and not isinstance(is_available, bool)
+        and is_available in (0, 1)
+    ):
         raise ValueError("is_available must be True, False, 0 or 1")
 
     status_code = service_check.get("status_code")
+    if status_code is not None and (
+        isinstance(status_code, bool)
+        or not isinstance(status_code, int)
+        or not 100 <= status_code <= 599
+    ):
+        raise ValueError("status_code must be an integer between 100 and 599")
+
     response_time = service_check.get("response_time_ms")
-    error_message = service_check.get("error_message")
-
-    if status_code is not None:
-        if (
-            isinstance(status_code, bool)
-            or not isinstance(status_code, int)
-            or not 100 <= status_code <= 599
-        ):
-            raise ValueError("Invalid HTTP status_code")
-
     if response_time is not None:
-        response_time = float(response_time)
-
+        try:
+            response_time = float(response_time)
+        except (TypeError, ValueError) as error:
+            raise ValueError("response_time_ms must be numeric or None") from error
         if not math.isfinite(response_time) or response_time < 0:
-            raise ValueError("Invalid response_time_ms")
+            raise ValueError("response_time_ms must be finite and non-negative")
 
+    error_message = service_check.get("error_message")
     if error_message is not None and not isinstance(error_message, str):
         raise ValueError("error_message must be a string or None")
 
     connection = get_connection(db_path)
-
     try:
         cursor = connection.execute(
             """
             INSERT INTO service_checks (
+                node_id,
                 timestamp_utc,
                 service_name,
                 url,
@@ -316,10 +338,10 @@ def save_service_check(
                 status_code,
                 response_time_ms,
                 error_message
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                node_id,
                 timestamp,
                 service_name,
                 url,
@@ -329,14 +351,11 @@ def save_service_check(
                 error_message,
             ),
         )
-
         connection.commit()
-        return cursor.lastrowid
-
+        return int(cursor.lastrowid)
     except sqlite3.Error:
         connection.rollback()
         raise
-
     finally:
         connection.close()
 
@@ -347,108 +366,83 @@ def get_service_checks(
     service_name: str | None = None,
     limit: int = 100,
     db_path: str | Path = DB_PATH,
-) -> list[dict]:
-    """
-    Truy van ket qua kiem tra dich vu HTTP.
-    Ho tro loc theo thoi gian va ten dich vu.
-    """
-
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-        raise ValueError("limit must be a positive integer")
-
+    node_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get HTTP checks newest-first, optionally filtered by time/name/node."""
+    _validate_limit(limit)
     query = "SELECT * FROM service_checks"
-    conditions = []
-    parameters = []
+    conditions: list[str] = []
+    parameters: list[Any] = []
 
     if start_time is not None:
         conditions.append("timestamp_utc >= ?")
-        parameters.append(start_time)
-
+        parameters.append(_validate_non_empty_string(start_time, "start_time"))
     if end_time is not None:
         conditions.append("timestamp_utc <= ?")
-        parameters.append(end_time)
-
+        parameters.append(_validate_non_empty_string(end_time, "end_time"))
     if service_name is not None:
         conditions.append("service_name = ?")
-        parameters.append(service_name)
+        parameters.append(_validate_non_empty_string(service_name, "service_name"))
+    if node_id is not None:
+        conditions.append("node_id = ?")
+        parameters.append(_validate_non_empty_string(node_id, "node_id"))
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-
     query += " ORDER BY timestamp_utc DESC, id DESC LIMIT ?"
     parameters.append(limit)
 
     connection = get_connection(db_path)
-
     try:
-        cursor = connection.execute(query, parameters)
-        return [dict(row) for row in cursor.fetchall()]
-
+        rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
     finally:
         connection.close()
 
-def save_alert(
-    alert: dict,
-    db_path: str | Path = DB_PATH
-) -> int:
-    """
-    Luu mot canh bao moi vao SQLite.
-    Tra ve ID cua canh bao.
-    """
 
-    required_fields = [
-        "created_at_utc",
-        "metric_name",
-        "severity",
-        "message",
-    ]
+def save_alert(alert: dict[str, Any], db_path: str | Path = DB_PATH) -> int:
+    """Save one alert and return its database ID."""
+    if not isinstance(alert, dict):
+        raise TypeError("alert must be a dictionary")
 
-    missing_fields = [
-        field for field in required_fields
-        if field not in alert
-    ]
-
+    required_fields = ("created_at_utc", "metric_name", "severity", "message")
+    missing_fields = [field for field in required_fields if field not in alert]
     if missing_fields:
         raise ValueError(f"Missing fields: {missing_fields}")
 
-    timestamp = alert["created_at_utc"]
-    metric_name = alert["metric_name"]
-    severity = alert["severity"]
-    message = alert["message"]
+    node_id = _get_node_id(alert)
+    timestamp = _validate_non_empty_string(
+        alert["created_at_utc"], "created_at_utc"
+    )
+    metric_name = _validate_non_empty_string(alert["metric_name"], "metric_name")
+    severity = _validate_non_empty_string(alert["severity"], "severity")
+    message = _validate_non_empty_string(alert["message"], "message")
     status = alert.get("status", "active")
     resolved_at = alert.get("resolved_at_utc")
 
-    for name, value in [
-        ("created_at_utc", timestamp),
-        ("metric_name", metric_name),
-        ("severity", severity),
-        ("message", message),
-    ]:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{name} must be a non-empty string")
-
     if status not in ("active", "resolved"):
-        raise ValueError("Invalid alert status")
-
-    if resolved_at is not None and not isinstance(resolved_at, str):
-        raise ValueError("resolved_at_utc must be a string or None")
+        raise ValueError("status must be 'active' or 'resolved'")
+    if resolved_at is not None:
+        resolved_at = _validate_non_empty_string(
+            resolved_at, "resolved_at_utc"
+        )
 
     connection = get_connection(db_path)
-
     try:
         cursor = connection.execute(
             """
             INSERT INTO alerts (
+                node_id,
                 created_at_utc,
                 metric_name,
                 severity,
                 message,
                 status,
                 resolved_at_utc
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                node_id,
                 timestamp,
                 metric_name,
                 severity,
@@ -457,14 +451,11 @@ def save_alert(
                 resolved_at,
             ),
         )
-
         connection.commit()
-        return cursor.lastrowid
-
+        return int(cursor.lastrowid)
     except sqlite3.Error:
         connection.rollback()
         raise
-
     finally:
         connection.close()
 
@@ -476,96 +467,80 @@ def get_alerts(
     status: str | None = None,
     limit: int = 100,
     db_path: str | Path = DB_PATH,
-) -> list[dict]:
-    """
-    Truy van lich su canh bao.
-    Ho tro loc theo thoi gian, muc do va trang thai.
-    """
-
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-        raise ValueError("limit must be a positive integer")
-
+    node_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get alerts newest-first, optionally filtered by time/severity/status/node."""
+    _validate_limit(limit)
     if status is not None and status not in ("active", "resolved"):
-        raise ValueError("Invalid alert status")
+        raise ValueError("status must be 'active' or 'resolved'")
 
     query = "SELECT * FROM alerts"
-    conditions = []
-    parameters = []
+    conditions: list[str] = []
+    parameters: list[Any] = []
 
     if start_time is not None:
         conditions.append("created_at_utc >= ?")
-        parameters.append(start_time)
-
+        parameters.append(_validate_non_empty_string(start_time, "start_time"))
     if end_time is not None:
         conditions.append("created_at_utc <= ?")
-        parameters.append(end_time)
-
+        parameters.append(_validate_non_empty_string(end_time, "end_time"))
     if severity is not None:
         conditions.append("severity = ?")
-        parameters.append(severity)
-
+        parameters.append(_validate_non_empty_string(severity, "severity"))
     if status is not None:
         conditions.append("status = ?")
         parameters.append(status)
+    if node_id is not None:
+        conditions.append("node_id = ?")
+        parameters.append(_validate_non_empty_string(node_id, "node_id"))
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-
     query += " ORDER BY created_at_utc DESC, id DESC LIMIT ?"
     parameters.append(limit)
 
     connection = get_connection(db_path)
-
     try:
-        cursor = connection.execute(query, parameters)
-        return [dict(row) for row in cursor.fetchall()]
-
+        rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
     finally:
         connection.close()
 
 
 def get_active_alerts(
     limit: int = 100,
-    db_path: str | Path = DB_PATH
-) -> list[dict]:
-    """
-    Lay danh sach canh bao dang hoat dong.
-    """
-
+    db_path: str | Path = DB_PATH,
+    node_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Get active alerts, optionally limited to one node."""
     return get_alerts(
         status="active",
         limit=limit,
         db_path=db_path,
+        node_id=node_id,
     )
 
 
 def update_alert_status(
     alert_id: int,
     status: str,
-    db_path: str | Path = DB_PATH
+    db_path: str | Path = DB_PATH,
 ) -> bool:
-    """
-    Cap nhat trang thai canh bao.
-    Tu dong ghi thoi gian khi canh bao duoc giai quyet.
-    """
-
+    """Update alert status and manage its resolved timestamp."""
     if isinstance(alert_id, bool) or not isinstance(alert_id, int) or alert_id <= 0:
         raise ValueError("alert_id must be a positive integer")
-
     if status not in ("active", "resolved"):
-        raise ValueError("Invalid alert status")
+        raise ValueError("status must be 'active' or 'resolved'")
 
+    resolved_at = None
     if status == "resolved":
         resolved_at = (
             datetime.now(timezone.utc)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z")
         )
-    else:
-        resolved_at = None
 
     connection = get_connection(db_path)
-
     try:
         cursor = connection.execute(
             """
@@ -575,19 +550,16 @@ def update_alert_status(
             """,
             (status, resolved_at, alert_id),
         )
-
         connection.commit()
         return cursor.rowcount > 0
-
     except sqlite3.Error:
         connection.rollback()
         raise
-
     finally:
         connection.close()
 
+
 if __name__ == "__main__":
     initialize_database()
-
     print("Database initialized successfully!")
     print(f"Database location: {DB_PATH}")
