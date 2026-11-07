@@ -107,7 +107,7 @@ def render(minutes: int, selected: list):
     fig.update_yaxes(matches=None, title=None)
     fig.update_xaxes(title=None)
     fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
  
     # Cảnh báo
     st.subheader("Cảnh báo")
@@ -115,7 +115,7 @@ def render(minutes: int, selected: list):
     if alerts.empty:
         st.success("Không có cảnh báo nào.")
     else:
-        st.dataframe(alerts, use_container_width=True, hide_index=True)
+        st.dataframe(alerts, width="stretch", hide_index=True)
  
  
 render(minutes, selected)
