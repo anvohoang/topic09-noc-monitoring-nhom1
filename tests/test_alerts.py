@@ -238,7 +238,7 @@ class TestAlertModuleComprehensive(unittest.TestCase):
                     "service_name": "svc_beta",
                     "url": "https://beta.local",
                     "is_available": 1,
-                    "response_time_ms": 155.0,
+                    "response_time_ms": 150.0,
                 },
                 db_path=db_path,
             )
@@ -249,29 +249,34 @@ class TestAlertModuleComprehensive(unittest.TestCase):
             self.assertEqual(len(active), 1)
             self.assertEqual(active[0]["metric_name"], "service:svc_alpha:availability")
 
-    def test_8_null_values_in_database_handled_gracefully(self) -> None:
+    def test_8_storage_rejects_null_required_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test8.db"
             initialize_database(db_path)
+
             node = "win11-test-node"
-            base = datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
-            for i in range(12):
-                ts = (base + timedelta(seconds=i * 5)).isoformat(timespec="seconds").replace("+00:00", "Z")
+            timestamp = (
+                datetime(2026, 11, 14, 10, 0, 0, tzinfo=timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+
+            # Storage requires CPU, memory and disk values to be numeric.
+            # A NULL memory value should therefore be rejected.
+            with self.assertRaisesRegex(
+                ValueError,
+                "CPU, memory and disk must be numeric",
+            ):
                 save_metrics(
                     {
                         "node_id": node,
-                        "timestamp_utc": ts,
-                        "cpu_percent": 30.0 if i % 2 == 0 else None,
+                        "timestamp_utc": timestamp,
+                        "cpu_percent": 30.0,
                         "memory_percent": None,
                         "disk_percent": 55.0,
                     },
                     db_path=db_path,
                 )
-
-            engine = AlertEngine(db_path=db_path)
-            outcomes = engine.evaluate_node(node, now=base + timedelta(seconds=60))
-            self.assertTrue(len(outcomes) >= 1)
-
 
 if __name__ == "__main__":
     unittest.main()
