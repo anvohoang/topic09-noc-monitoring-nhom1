@@ -366,6 +366,146 @@ class AlertEngine:
             ),
         )
 
+    def process_analysis_results(
+        self,
+        node_id: str,
+        analysis_results: list[dict[str, Any]],
+        now: datetime | None = None,
+    ) -> list[AlertEvaluationOutcome]:
+        """
+        Nhận kết quả từ Analyzer và quản lý vòng đời cảnh báo.
+
+        Analyzer chịu trách nhiệm phát hiện bất thường.
+        Alert Engine chịu trách nhiệm tạo, chống trùng,
+        cooldown và tự động giải quyết cảnh báo.
+        """
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise ValueError("node_id must be a non-empty string")
+
+        if not isinstance(analysis_results, list):
+            raise TypeError("analysis_results must be a list")
+
+        node_id = node_id.strip()
+        evaluation_time = self._utc_now(now)
+        outcomes: list[AlertEvaluationOutcome] = []
+
+        active_alerts = get_active_alerts(
+            db_path=self.db_path,
+            node_id=node_id,
+        )
+
+        for result in analysis_results:
+            if not isinstance(result, dict):
+                raise TypeError("Each analysis result must be a dictionary")
+
+            result_node_id = str(result.get("node_id") or node_id)
+
+            if result_node_id != node_id:
+                raise ValueError(
+                    f"Result node_id mismatch: expected {node_id}, "
+                    f"received {result_node_id}"
+                )
+
+            metric_name = result.get("metric_name")
+            if not isinstance(metric_name, str) or not metric_name.strip():
+                raise ValueError("metric_name must be a non-empty string")
+
+            metric_name = metric_name.strip()
+            current_value = float(result["current_value"])
+
+            analyzer_severity = str(
+                result.get("severity", "NORMAL")
+            ).strip().lower()
+
+            if analyzer_severity not in SEVERITY_RANK:
+                raise ValueError(
+                    f"Unsupported Analyzer severity: {analyzer_severity}"
+                )
+
+            message = str(result.get("message") or "").strip()
+
+            # Giữ lại các ngưỡng tĩnh của Alert Engine.
+            # Analyzer vẫn là nguồn phát hiện bất thường thống kê.
+            static_severity, static_message = self._evaluate_static(
+                metric_name,
+                current_value,
+            )
+
+            analyzer_triggered = analyzer_severity != "normal"
+            static_triggered = static_severity != "normal"
+
+            if SEVERITY_RANK[static_severity] > SEVERITY_RANK[analyzer_severity]:
+                final_severity = static_severity
+            else:
+                final_severity = analyzer_severity
+
+            if analyzer_triggered and static_triggered:
+                triggered_by = "both"
+                final_message = (
+                    f"[{metric_name}] {static_message} | {message}"
+                )
+            elif static_triggered:
+                triggered_by = "static"
+                final_message = f"[{metric_name}] {static_message}"
+            elif analyzer_triggered:
+                triggered_by = "analyzer"
+                final_message = message
+            else:
+                triggered_by = "none"
+                final_message = message or (
+                    f"{metric_name} is normal at {current_value:.2f}"
+                )
+
+            # Không tự resolve cảnh báo chỉ vì Analyzer chưa đủ
+            # dữ liệu lịch sử để đưa ra kết luận.
+            insufficient_history = (
+                "insufficient historical data" in message.lower()
+                or "insufficient baseline samples" in message.lower()
+            )
+
+            if (
+                final_severity == "normal"
+                and insufficient_history
+            ):
+                continue
+
+            outcome = self._handle_alert_lifecycle(
+                node_id=node_id,
+                metric_name=metric_name,
+                current_value=current_value,
+                severity=final_severity,
+                triggered_by=triggered_by,
+                message=final_message,
+                now=evaluation_time,
+                active_alerts=active_alerts,
+            )
+
+            outcomes.append(outcome)
+
+            # Cập nhật danh sách cảnh báo đang hoạt động trong
+            # chu kỳ hiện tại để tránh xử lý trùng một metric.
+            if outcome.alert_saved and outcome.alert_id is not None:
+                active_alerts.append(
+                    {
+                        "id": outcome.alert_id,
+                        "node_id": node_id,
+                        "metric_name": metric_name,
+                        "created_at_utc": self._format_utc(
+                            evaluation_time
+                        ),
+                    }
+                )
+
+            if outcome.auto_resolved_ids:
+                resolved_ids = set(outcome.auto_resolved_ids)
+                active_alerts = [
+                    alert
+                    for alert in active_alerts
+                    if int(alert.get("id", 0)) not in resolved_ids
+                ]
+
+        return outcomes
+
     def evaluate_node(
         self,
         node_id: str,
