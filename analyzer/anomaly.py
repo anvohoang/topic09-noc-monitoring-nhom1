@@ -1,140 +1,21 @@
-"""Module Analyzer phát hiện bất thường bằng Rolling Z-Score và Static Thresholds."""
+"""Anomaly detection for the NOC monitoring toolkit."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from storage.database import DB_PATH, get_metrics, get_service_checks
 
-@dataclass
-class AnomalyResult:
-    metric_name: str
-    current_value: float
-    mean: float
-    std: float
-    z_score: float
-    is_anomaly: bool
-    severity: str
-    reason: str
-
-
-class RollingZScoreDetector:
-    def __init__(
-        self,
-        window_size: int = 30,
-        min_samples: int = 10,
-        warning_threshold: float = 2.0,
-        critical_threshold: float = 3.0,
-    ) -> None:
-        if window_size < 2:
-            raise ValueError("window_size must be >= 2")
-
-        if min_samples < 2 or min_samples > window_size:
-            raise ValueError(
-                "min_samples must be between 2 and window_size"
-            )
-
-        if warning_threshold <= 0 or critical_threshold <= warning_threshold:
-            raise ValueError(
-                "Thresholds must satisfy 0 < warning < critical"
-            )
-
-        self.window_size = window_size
-        self.min_samples = min_samples
-        self.warning_threshold = warning_threshold
-        self.critical_threshold = critical_threshold
-
-    def evaluate(
-        self,
-        metric_name: str,
-        values: list[float],
-        only_spikes: bool = True,
-    ) -> AnomalyResult:
-        if not values:
-            raise ValueError("values list cannot be empty")
-
-        current_value = float(values[-1])
-        history = values[:-1]
-
-        if len(history) < self.min_samples:
-            return AnomalyResult(
-                metric_name=metric_name,
-                current_value=current_value,
-                mean=current_value,
-                std=0.0,
-                z_score=0.0,
-                is_anomaly=False,
-                severity="normal",
-                reason=(
-                    f"Insufficient baseline samples "
-                    f"({len(history)}/{self.min_samples})"
-                ),
-            )
-
-        baseline = np.asarray(
-            history[-self.window_size:],
-            dtype=float,
-        )
-
-        mean = float(np.mean(baseline))
-        std = float(np.std(baseline))
-
-        effective_std = max(std, 1.0)
-        z_score = (current_value - mean) / effective_std
-
-        score_to_check = (
-            z_score if only_spikes else abs(z_score)
-        )
-
-        if score_to_check >= self.critical_threshold:
-            severity = "critical"
-            is_anomaly = True
-            reason = (
-                f"Critical Z-Score spike on {metric_name}: "
-                f"current={current_value:.2f}, "
-                f"mean={mean:.2f}, "
-                f"std={std:.2f}, "
-                f"z={z_score:.2f}"
-            )
-
-        elif score_to_check >= self.warning_threshold:
-            severity = "warning"
-            is_anomaly = True
-            reason = (
-                f"Warning Z-Score spike on {metric_name}: "
-                f"current={current_value:.2f}, "
-                f"mean={mean:.2f}, "
-                f"std={std:.2f}, "
-                f"z={z_score:.2f}"
-            )
-
-        else:
-            severity = "normal"
-            is_anomaly = False
-            reason = f"Normal (z={z_score:.2f})"
-
-        return AnomalyResult(
-            metric_name=metric_name,
-            current_value=current_value,
-            mean=round(mean, 4),
-            std=round(std, 4),
-            z_score=round(z_score, 4),
-            is_anomaly=is_anomaly,
-            severity=severity,
-            reason=reason,
-        )
 WINDOW_SIZE = 30
 MIN_HISTORY_SAMPLES = 5
 WARNING_Z_THRESHOLD = 3.0
 CRITICAL_Z_THRESHOLD = 5.0
 
 DEFAULT_CYCLE_SECONDS = 5.0
+MAX_VALID_CYCLE_SECONDS = 60.0
 
 MIN_STD_PERCENT = 0.5
 MIN_STD_NETWORK_BPS = 100.0
@@ -144,33 +25,105 @@ DISK_WARNING_THRESHOLD = 85.0
 DISK_CRITICAL_THRESHOLD = 90.0
 HTTP_LATENCY_CRITICAL_MS = 1000.0
 
+RESULT_FIELDS = {
+    "node_id",
+    "timestamp_utc",
+    "metric_name",
+    "current_value",
+    "mean",
+    "std",
+    "z_score",
+    "is_anomaly",
+    "severity",
+    "message",
+}
 
 def _parse_iso_utc(timestamp_str: str) -> datetime | None:
     if not isinstance(timestamp_str, str) or not timestamp_str.strip():
         return None
+
     try:
         clean_str = timestamp_str.strip().replace("Z", "+00:00")
         return datetime.fromisoformat(clean_str)
     except ValueError:
         return None
 
-
 def _calculate_mean_and_std(values: list[float]) -> tuple[float, float]:
-    n = len(values)
-    if n == 0:
+    if not values:
         return 0.0, 0.0
 
+    n = len(values)
     mean_val = sum(values) / n
-    variance = sum((x - mean_val) ** 2 for x in values) / n
+    variance = sum((value - mean_val) ** 2 for value in values) / n
     std_val = math.sqrt(variance)
+
     return mean_val, std_val
 
+def _make_result(
+    *,
+    node_id: str,
+    timestamp_utc: str,
+    metric_name: str,
+    current_value: float,
+    mean: float | None,
+    std: float | None,
+    z_score: float | None,
+    is_anomaly: bool,
+    severity: str,
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "timestamp_utc": timestamp_utc,
+        "metric_name": metric_name,
+        "current_value": round(current_value, 2),
+        "mean": round(mean, 2) if mean is not None else None,
+        "std": round(std, 2) if std is not None else None,
+        "z_score": round(z_score, 2) if z_score is not None else None,
+        "is_anomaly": is_anomaly,
+        "severity": severity,
+        "message": message,
+    }
+
+def _apply_static_threshold(
+    metric_name: str,
+    current_value: float,
+) -> tuple[str, str] | None:
+    if metric_name == "disk_percent":
+        if current_value > DISK_CRITICAL_THRESHOLD:
+            return (
+                "CRITICAL",
+                f"[CRITICAL] disk usage is {current_value:.2f}% "
+                f"(exceeded {DISK_CRITICAL_THRESHOLD}%).",
+            )
+        if current_value > DISK_WARNING_THRESHOLD:
+            return (
+                "WARNING",
+                f"[WARNING] disk usage is {current_value:.2f}% "
+                f"(exceeded {DISK_WARNING_THRESHOLD}%).",
+            )
+
+    if metric_name.startswith("http_latency_ms"):
+        if current_value > HTTP_LATENCY_CRITICAL_MS:
+            return (
+                "CRITICAL",
+                f"[CRITICAL] HTTP latency is {current_value:.2f}ms "
+                f"(exceeded {HTTP_LATENCY_CRITICAL_MS:.0f}ms).",
+            )
+
+    return None
+
+def _severity_rank(severity: str) -> int:
+    return {"NORMAL": 0, "WARNING": 1, "CRITICAL": 2}.get(severity, 0)
 
 def _convert_network_delta_to_bps(
     chronological_records: list[dict[str, Any]],
     byte_column: str,
     default_cycle_sec: float = DEFAULT_CYCLE_SECONDS,
 ) -> list[tuple[str, float]]:
+    if default_cycle_sec <= 0:
+        raise ValueError("default_cycle_sec must be greater than 0")
+
     bps_list: list[tuple[str, float]] = []
 
     for idx, record in enumerate(chronological_records):
@@ -179,20 +132,23 @@ def _convert_network_delta_to_bps(
             continue
 
         delta_sec = default_cycle_sec
+
         if idx > 0:
-            prev_ts = _parse_iso_utc(chronological_records[idx - 1].get("timestamp_utc", ""))
-            curr_ts = _parse_iso_utc(record.get("timestamp_utc", ""))
-            if prev_ts is not None and curr_ts is not None:
-                measured_sec = (curr_ts - prev_ts).total_seconds()
-                if 0.0 < measured_sec <= 60.0:
+            previous_record = chronological_records[idx - 1]
+            previous_ts = _parse_iso_utc(previous_record.get("timestamp_utc", ""))
+            current_ts = _parse_iso_utc(record.get("timestamp_utc", ""))
+
+            if previous_ts is not None and current_ts is not None:
+                measured_sec = (current_ts - previous_ts).total_seconds()
+                if 0.0 < measured_sec <= MAX_VALID_CYCLE_SECONDS:
                     delta_sec = measured_sec
 
-        rate_bps = max(0.0, float(byte_delta)) / delta_sec
-        ts_str = str(record.get("timestamp_utc", ""))
-        bps_list.append((ts_str, rate_bps))
+        byte_value = max(0.0, float(byte_delta))
+        rate_bps = byte_value / delta_sec
+        timestamp = str(record.get("timestamp_utc", ""))
+        bps_list.append((timestamp, rate_bps))
 
     return bps_list
-
 
 def analyze_metric_series(
     node_id: str,
@@ -204,112 +160,93 @@ def analyze_metric_series(
     min_samples: int = MIN_HISTORY_SAMPLES,
     min_std_floor: float = MIN_STD_PERCENT,
 ) -> dict[str, Any]:
-    baseline_window = [float(x) for x in historical_values[-window_size:]]
-    curr_val = float(current_value)
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if min_samples < 1:
+        raise ValueError("min_samples must be at least 1")
+    if min_std_floor <= 0:
+        raise ValueError("min_std_floor must be greater than 0")
+
+    current = float(current_value)
+    if not math.isfinite(current):
+        raise ValueError("current_value must be a finite number")
+
+    baseline_window = [
+        float(value)
+        for value in historical_values[-window_size:]
+        if value is not None and math.isfinite(float(value))
+    ]
+
+    mean_val: float | None = None
+    std_val: float | None = None
+    z_score: float | None = None
+    is_anomaly = False
+    severity = "NORMAL"
 
     if len(baseline_window) < min_samples:
-        is_anomaly = False
-        severity = "NORMAL"
         message = (
             f"Insufficient historical data for {metric_name} on {node_id} "
             f"({len(baseline_window)}/{min_samples} samples collected)."
         )
-
-        if metric_name == "disk_percent":
-            if curr_val > DISK_CRITICAL_THRESHOLD:
-                is_anomaly = True
-                severity = "CRITICAL"
-                message = (
-                    f"[CRITICAL] disk_percent on {node_id} is {curr_val:.2f}% "
-                    f"(exceeded static threshold > {DISK_CRITICAL_THRESHOLD}%)."
-                )
-            elif curr_val > DISK_WARNING_THRESHOLD:
-                is_anomaly = True
-                severity = "WARNING"
-                message = (
-                    f"[WARNING] disk_percent on {node_id} is {curr_val:.2f}% "
-                    f"(exceeded static threshold > {DISK_WARNING_THRESHOLD}%)."
-                )
-
-        return {
-            "node_id": node_id,
-            "timestamp_utc": timestamp_utc,
-            "metric_name": metric_name,
-            "current_value": round(curr_val, 2),
-            "mean": None,
-            "std": None,
-            "z_score": None,
-            "is_anomaly": is_anomaly,
-            "severity": severity,
-            "message": message,
-        }
-
-    mean_val, std_val = _calculate_mean_and_std(baseline_window)
-
-    if std_val == 0.0:
-        if math.isclose(curr_val, mean_val, abs_tol=1e-9):
-            z_score = 0.0
-        else:
-            z_score = (curr_val - mean_val) / min_std_floor
     else:
+        mean_val, std_val = _calculate_mean_and_std(baseline_window)
         effective_std = max(std_val, min_std_floor)
-        z_score = (curr_val - mean_val) / effective_std
+        z_score = (current - mean_val) / effective_std
+        abs_z = abs(z_score)
 
-    abs_z = abs(z_score)
-
-    if abs_z >= CRITICAL_Z_THRESHOLD:
-        is_anomaly = True
-        severity = "CRITICAL"
-        direction = "spiked" if z_score > 0 else "dropped"
-        message = (
-            f"[CRITICAL] {metric_name} on {node_id} {direction} to {curr_val:.2f} "
-            f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
-        )
-    elif abs_z > WARNING_Z_THRESHOLD:
-        is_anomaly = True
-        severity = "WARNING"
-        direction = "increased" if z_score > 0 else "decreased"
-        message = (
-            f"[WARNING] {metric_name} on {node_id} {direction} abnormally to {curr_val:.2f} "
-            f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
-        )
-    else:
-        is_anomaly = False
-        severity = "NORMAL"
-        message = (
-            f"{metric_name} on {node_id} is normal at {curr_val:.2f} "
-            f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
-        )
-
-    if metric_name == "disk_percent":
-        if curr_val > DISK_CRITICAL_THRESHOLD and severity != "CRITICAL":
+        if abs_z >= CRITICAL_Z_THRESHOLD:
             is_anomaly = True
             severity = "CRITICAL"
+            direction = "increased" if z_score > 0 else "decreased"
             message = (
-                f"[CRITICAL] disk_percent on {node_id} reached {curr_val:.2f}% "
-                f"(exceeded static threshold > {DISK_CRITICAL_THRESHOLD}%, z_score={z_score:.2f})."
+                f"[CRITICAL] {metric_name} on {node_id} {direction} to {current:.2f} "
+                f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
             )
-        elif curr_val > DISK_WARNING_THRESHOLD and severity == "NORMAL":
+        elif abs_z > WARNING_Z_THRESHOLD:
             is_anomaly = True
             severity = "WARNING"
+            direction = "increased" if z_score > 0 else "decreased"
             message = (
-                f"[WARNING] disk_percent on {node_id} reached {curr_val:.2f}% "
-                f"(exceeded static threshold > {DISK_WARNING_THRESHOLD}%, z_score={z_score:.2f})."
+                f"[WARNING] {metric_name} on {node_id} {direction} abnormally to {current:.2f} "
+                f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
+            )
+        else:
+            message = (
+                f"{metric_name} on {node_id} is normal at {current:.2f} "
+                f"(mean={mean_val:.2f}, std={std_val:.2f}, z_score={z_score:.2f})."
             )
 
-    return {
-        "node_id": node_id,
-        "timestamp_utc": timestamp_utc,
-        "metric_name": metric_name,
-        "current_value": round(curr_val, 2),
-        "mean": round(mean_val, 2),
-        "std": round(std_val, 2),
-        "z_score": round(z_score, 2),
-        "is_anomaly": is_anomaly,
-        "severity": severity,
-        "message": message,
-    }
+    static_alert = _apply_static_threshold(metric_name, current)
+    if static_alert is not None:
+        static_severity, static_message = static_alert
+        if _severity_rank(static_severity) >= _severity_rank(severity):
+            is_anomaly = True
+            severity = static_severity
+            message = static_message
 
+    return _make_result(
+        node_id=node_id,
+        timestamp_utc=timestamp_utc,
+        metric_name=metric_name,
+        current_value=current,
+        mean=mean_val,
+        std=std_val,
+        z_score=z_score,
+        is_anomaly=is_anomaly,
+        severity=severity,
+        message=message,
+    )
+
+def _sort_records_chronologically(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda record: (
+            str(record.get("timestamp_utc", "")),
+            int(record.get("id", 0)),
+        ),
+    )
 
 def analyze_node(
     node_id: str = "windows-11-node-01",
@@ -321,36 +258,32 @@ def analyze_node(
     if not records:
         return []
 
-    chronological = sorted(
-        records,
-        key=lambda r: (str(r.get("timestamp_utc", "")), int(r.get("id", 0))),
-    )
-
+    chronological = _sort_records_chronologically(records)
     latest_record = chronological[-1]
     history_records = chronological[:-1]
-    latest_ts = str(latest_record.get("timestamp_utc", ""))
+    latest_timestamp = str(latest_record.get("timestamp_utc", ""))
     target_node = str(latest_record.get("node_id", node_id))
 
     results: list[dict[str, Any]] = []
 
-    for col_name in ("cpu_percent", "memory_percent", "disk_percent"):
-        if col_name not in latest_record or latest_record[col_name] is None:
+    for metric_name in ("cpu_percent", "memory_percent", "disk_percent"):
+        current_raw = latest_record.get(metric_name)
+        if current_raw is None:
             continue
 
-        curr_val = float(latest_record[col_name])
-        hist_vals = [
-            float(r[col_name])
-            for r in history_records
-            if col_name in r and r[col_name] is not None
+        historical_values = [
+            float(record[metric_name])
+            for record in history_records
+            if record.get(metric_name) is not None
         ]
 
         results.append(
             analyze_metric_series(
                 node_id=target_node,
-                timestamp_utc=latest_ts,
-                metric_name=col_name,
-                current_value=curr_val,
-                historical_values=hist_vals,
+                timestamp_utc=latest_timestamp,
+                metric_name=metric_name,
+                current_value=float(current_raw),
+                historical_values=historical_values,
                 window_size=window_size,
                 min_std_floor=MIN_STD_PERCENT,
             )
@@ -361,28 +294,31 @@ def analyze_node(
         ("network_recv_bytes", "network_recv_bytes_per_sec"),
     )
 
-    for raw_col, bps_metric_name in network_columns:
-        bps_series = _convert_network_delta_to_bps(chronological, raw_col)
+    for source_column, metric_name in network_columns:
+
+        if latest_record.get(source_column) is None:
+            continue
+
+        bps_series = _convert_network_delta_to_bps(chronological, source_column)
         if not bps_series:
             continue
 
-        curr_ts, curr_bps = bps_series[-1]
-        hist_bps = [val for _, val in bps_series[:-1]]
+        current_timestamp, current_bps = bps_series[-1]
+        historical_bps = [value for _, value in bps_series[:-1]]
 
         results.append(
             analyze_metric_series(
                 node_id=target_node,
-                timestamp_utc=curr_ts,
-                metric_name=bps_metric_name,
-                current_value=curr_bps,
-                historical_values=hist_bps,
+                timestamp_utc=current_timestamp,
+                metric_name=metric_name,
+                current_value=current_bps,
+                historical_values=historical_bps,
                 window_size=window_size,
                 min_std_floor=MIN_STD_NETWORK_BPS,
             )
         )
 
     return results
-
 
 def analyze_service_checks(
     node_id: str = "windows-11-node-01",
@@ -402,75 +338,64 @@ def analyze_service_checks(
 
     checks_by_service: dict[str, list[dict[str, Any]]] = {}
     for record in checks:
-        svc_name = str(record.get("service_name", "http_service"))
-        checks_by_service.setdefault(svc_name, []).append(record)
+        service = str(record.get("service_name", "http_service"))
+        checks_by_service.setdefault(service, []).append(record)
 
     results: list[dict[str, Any]] = []
 
-    for svc_name, service_checks in checks_by_service.items():
-        chronological = sorted(
-            service_checks,
-            key=lambda r: (str(r.get("timestamp_utc", "")), int(r.get("id", 0))),
-        )
-
+    for service, service_records in checks_by_service.items():
+        chronological = _sort_records_chronologically(service_records)
         latest = chronological[-1]
         history = chronological[:-1]
-        latest_ts = str(latest.get("timestamp_utc", ""))
-        target_node = str(latest.get("node_id", node_id))
 
+        timestamp = str(latest.get("timestamp_utc", ""))
+        target_node = str(latest.get("node_id", node_id))
         is_up = int(latest.get("is_available", 0)) == 1
+        url = latest.get("url")
+
         results.append(
-            {
-                "node_id": target_node,
-                "timestamp_utc": latest_ts,
-                "metric_name": f"http_availability:{svc_name}",
-                "current_value": 1.0 if is_up else 0.0,
-                "mean": 1.0,
-                "std": 0.0,
-                "z_score": 0.0 if is_up else None,
-                "is_anomaly": not is_up,
-                "severity": "NORMAL" if is_up else "CRITICAL",
-                "message": (
-                    f"HTTP service '{svc_name}' ({latest.get('url')}) on {target_node} is UP."
+            _make_result(
+                node_id=target_node,
+                timestamp_utc=timestamp,
+                metric_name=f"http_availability:{service}",
+                current_value=1.0 if is_up else 0.0,
+                mean=None,
+                std=None,
+                z_score=None,
+                is_anomaly=not is_up,
+                severity="NORMAL" if is_up else "CRITICAL",
+                message=(
+                    f"HTTP service '{service}' ({url}) on {target_node} is UP."
                     if is_up
-                    else f"[CRITICAL] HTTP service '{svc_name}' ({latest.get('url')}) on {target_node} is DOWN!"
+                    else f"[CRITICAL] HTTP service '{service}' ({url}) on {target_node} is DOWN."
                 ),
-            }
+            )
         )
 
-        if is_up and latest.get("response_time_ms") is not None:
-            curr_latency = float(latest["response_time_ms"])
-            hist_latencies = [
-                float(r["response_time_ms"])
-                for r in history
-                if int(r.get("is_available", 0)) == 1 and r.get("response_time_ms") is not None
-            ]
+        current_latency = latest.get("response_time_ms")
+        if not is_up or current_latency is None:
+            continue
 
-            latency_result = analyze_metric_series(
+        historical_latencies = [
+            float(record["response_time_ms"])
+            for record in history
+            if int(record.get("is_available", 0)) == 1
+            and record.get("response_time_ms") is not None
+        ]
+
+        results.append(
+            analyze_metric_series(
                 node_id=target_node,
-                timestamp_utc=latest_ts,
-                metric_name=f"http_latency_ms:{svc_name}",
-                current_value=curr_latency,
-                historical_values=hist_latencies,
+                timestamp_utc=timestamp,
+                metric_name=f"http_latency_ms:{service}",
+                current_value=float(current_latency),
+                historical_values=historical_latencies,
                 window_size=window_size,
                 min_std_floor=MIN_STD_LATENCY_MS,
             )
-
-            if curr_latency > HTTP_LATENCY_CRITICAL_MS and latency_result["severity"] != "CRITICAL":
-                latency_result["is_anomaly"] = True
-                latency_result["severity"] = "CRITICAL"
-                z_score = latency_result["z_score"]
-                z_score_text = f"{z_score:.2f}" if z_score is not None else "N/A"
-                latency_result["message"] = (
-                    f"[CRITICAL] http_latency_ms:{svc_name} on {target_node} reached {curr_latency:.2f}ms "
-                    f"(exceeded static threshold > {HTTP_LATENCY_CRITICAL_MS}ms, "
-                    f"z_score={z_score_text})."
-                )
-
-            results.append(latency_result)
+        )
 
     return results
-
 
 def analyze_all_for_node(
     node_id: str = "windows-11-node-01",
@@ -495,25 +420,26 @@ def analyze_all_for_node(
 if __name__ == "__main__":
     from pprint import pprint
     import tempfile
+
     from storage.database import initialize_database, save_metrics, save_service_check
 
-    print("=== KIỂM THỬ MODULE ANALYZER (KHOA) VỚI DATABASE (ÂN) & COLLECTOR (TIẾN ANH) ===")
+    print("=== NOC Analyzer demo ===")
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        test_db_path = Path(tmp_dir) / "test_noc_monitoring.db"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_db_path = Path(temp_dir) / "test_noc_monitoring.db"
         initialize_database(test_db_path)
 
-        for i in range(30):
-            total_sec = i * 5
-            mm = total_sec // 60
-            ss = total_sec % 60
-            ts = f"2026-11-04T15:{mm:02d}:{ss:02d}Z"
+        start_time = datetime(2026, 11, 4, 15, 0, 0, tzinfo=timezone.utc)
+
+        for index in range(30):
+            timestamp = (start_time + timedelta(seconds=index * 5)).isoformat()
+            timestamp = timestamp.replace("+00:00", "Z")
 
             save_metrics(
                 {
                     "node_id": "windows-11-node-01",
-                    "timestamp_utc": ts,
-                    "cpu_percent": 22.0 + (i % 3),
+                    "timestamp_utc": timestamp,
+                    "cpu_percent": 22.0 + (index % 3),
                     "memory_percent": 65.0,
                     "disk_percent": 91.5,
                     "network_sent_bytes": 10000,
@@ -525,21 +451,23 @@ if __name__ == "__main__":
             save_service_check(
                 {
                     "node_id": "windows-11-node-01",
-                    "timestamp_utc": ts,
+                    "timestamp_utc": timestamp,
                     "service_name": "portal-web",
-                    "url": "https://httpbin.org/get",
+                    "url": "http://localhost/health",
                     "is_available": True,
                     "status_code": 200,
-                    "response_time_ms": 120.0 + (i % 5),
+                    "response_time_ms": 120.0 + (index % 5),
                 },
                 db_path=test_db_path,
             )
 
-        latest_ts = "2026-11-04T15:02:30Z"
+        latest_timestamp = (start_time + timedelta(seconds=30 * 5)).isoformat()
+        latest_timestamp = latest_timestamp.replace("+00:00", "Z")
+
         save_metrics(
             {
                 "node_id": "windows-11-node-01",
-                "timestamp_utc": latest_ts,
+                "timestamp_utc": latest_timestamp,
                 "cpu_percent": 88.0,
                 "memory_percent": 65.0,
                 "disk_percent": 91.5,
@@ -552,9 +480,9 @@ if __name__ == "__main__":
         save_service_check(
             {
                 "node_id": "windows-11-node-01",
-                "timestamp_utc": latest_ts,
+                "timestamp_utc": latest_timestamp,
                 "service_name": "portal-web",
-                "url": "https://httpbin.org/get",
+                "url": "http://localhost/health",
                 "is_available": True,
                 "status_code": 200,
                 "response_time_ms": 1250.0,
@@ -562,10 +490,12 @@ if __name__ == "__main__":
             db_path=test_db_path,
         )
 
-        print("\n--- 1. Kết quả analyze_node() (5 chỉ số hệ thống) ---")
-        node_results = analyze_node(node_id="windows-11-node-01", db_path=test_db_path)
-        pprint(node_results, sort_dicts=False)
+        results = analyze_all_for_node(
+            node_id="windows-11-node-01",
+            db_path=test_db_path,
+        )
 
-        print("\n--- 2. Kết quả analyze_service_checks() (Trạng thái & Độ trễ HTTP) ---")
-        http_results = analyze_service_checks(node_id="windows-11-node-01", db_path=test_db_path)
-        pprint(http_results, sort_dicts=False)
+        for result in results:
+            assert set(result.keys()) == RESULT_FIELDS
+
+        pprint(results, sort_dicts=False)
